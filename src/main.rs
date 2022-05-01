@@ -16,8 +16,8 @@ fn resolve_reverse(ip_text : &String) -> String {
     dns_lookup::lookup_addr(&ip).unwrap()
 }
 
-fn async_test(res : &StubResolver, name: &String) {
-    let q = Question::new_in(name, domain::base::iana::rtype::Rtype::A);
+fn _async_test(_res : &StubResolver, name: &String) {
+    let _q = Question::new_in(name, domain::base::iana::rtype::Rtype::A);
     // not like this
     //res.query(&q);
 }
@@ -76,12 +76,12 @@ async fn reverse(resolver: &StubResolver, addr: IpAddr) {
     }
 }
 
-//#[tokio::main]
+#[tokio::main]
 async fn resolve_async(resolver: &StubResolver, names: &Vec<String>) {
     for name in names {
-        if let Ok(addr) = IpAddr::from_str(&name) {
+        if let Ok(addr) = IpAddr::from_str(name) {
             reverse(&resolver, addr).await;
-        } else if let Ok(name) = UncertainDname::from_str(&name) {
+        } else if let Ok(name) = UncertainDname::from_str(name) {
             forward(&resolver, name).await;
         } else {
             println!("Not a domain name: {}", name);
@@ -97,8 +97,7 @@ fn resolve_sync(names: &Vec<String>) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // example source: https://github.com/NLnetLabs/domain/blob/main/examples/lookup.rs
     let names: Vec<_> = env::args().skip(1).collect();
     if names.is_empty() {
