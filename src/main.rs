@@ -6,14 +6,24 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use dns_lookup;
-//use tokio;
 use domain::resolv::StubResolver;
 use domain::base::question::Question;
 use domain::base::name::UncertainDname;
 
-fn resolve_reverse(ip_text : &String) -> String {
-    let ip: IpAddr = ip_text.parse().unwrap();
-    dns_lookup::lookup_addr(&ip).unwrap()
+
+
+fn resolve_one_synchronous(name : &String) {
+    let _r = match IpAddr::from_str(&name) {
+        Ok(addr) => {
+            let host = dns_lookup::lookup_addr(&addr).unwrap();
+            println!("{} has hostname {}", &name, &host);
+        },
+        Err(_err) => {
+            for ip in dns_lookup::lookup_host(&name).unwrap() {
+                println!("{} has address {}", &name, &ip);
+            }
+        },
+    };
 }
 
 fn _async_test(_res : &StubResolver, name: &String) {
@@ -22,19 +32,28 @@ fn _async_test(_res : &StubResolver, name: &String) {
     //res.query(&q);
 }
 
+fn print_opt_bool(value: bool, desc: &str) {
+    if value
+        { print!("{} ", desc); }
+    else
+        { print!("no-{} ", desc); }
+}
+
 fn print_options(res : &StubResolver) {
 
     let o = res.options();
 
     println!();
     println!("Local stub options:");
-    println!("Recursing: {}", o.recurse);
-    println!("TCP: {}", o.use_vc);
-    println!("EDNS: {}", o.use_edns0);
-    println!("AA_only: {}", o.aa_only);
-    println!("attempts: {}", o.attempts);
-    println!("timeout: {}", o.timeout.as_secs());
+    print_opt_bool(o.recurse, "recursion");
+    print_opt_bool(o.use_vc, "TCP");
+    print_opt_bool(o.use_edns0, "EDNS0");
+    print_opt_bool(o.aa_only, "AA-only");
+    println!();
+    print!("attempts: {} ", o.attempts);
+    print!("timeout: {} ", o.timeout.as_secs());
     println!("ndots: {}", o.ndots);
+    println!();
 }
 
 async fn forward(resolver: &StubResolver, name: UncertainDname<Vec<u8>>) {
@@ -78,6 +97,7 @@ async fn reverse(resolver: &StubResolver, addr: IpAddr) {
 
 #[tokio::main]
 async fn resolve_async(resolver: &StubResolver, names: &Vec<String>) {
+    println!("Asynchronous resolution");
     for name in names {
         if let Ok(addr) = IpAddr::from_str(name) {
             reverse(&resolver, addr).await;
@@ -92,8 +112,7 @@ async fn resolve_async(resolver: &StubResolver, names: &Vec<String>) {
 fn resolve_sync(names: &Vec<String>) {
     println!("Blocking resolution:");
     for name in names {
-        let addr = resolve_reverse(&name);
-        println!("{} has address {}", &name, &addr);
+        resolve_one_synchronous(&name);
     }
 }
 
