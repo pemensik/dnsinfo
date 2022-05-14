@@ -4,19 +4,27 @@
 use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
+//use std::time::{Duration, Instant};
+use std::time::{Instant};
 
 use dns_lookup;
 use domain::resolv::StubResolver;
 use domain::base::question::Question;
-use domain::base::name::UncertainDname;
-
+use domain::base::name;
+use domain::base::iana::rtype::Rtype;
 
 
 fn resolve_one_synchronous(name : &String) {
     let _r = match IpAddr::from_str(&name) {
         Ok(addr) => {
-            let host = dns_lookup::lookup_addr(&addr).unwrap();
-            println!("{} has hostname {}", &name, &host);
+            match dns_lookup::lookup_addr(&addr) {
+                Ok(host) => {
+                    println!("{} has hostname {}", &name, &host);
+                },
+                Err(err) => {
+                    println!("Error on {}: {}", name, err);
+                }
+            };
         },
         Err(_err) => {
             for ip in dns_lookup::lookup_host(&name).unwrap() {
@@ -56,18 +64,18 @@ fn print_options(res : &StubResolver) {
     println!();
 }
 
-async fn forward(resolver: &StubResolver, name: UncertainDname<Vec<u8>>) {
+async fn forward(resolver: &StubResolver, name: name::UncertainDname<Vec<u8>>) {
     let answer = match name {
-        UncertainDname::Absolute(ref name) => {
+        name::UncertainDname::Absolute(ref name) => {
             resolver.lookup_host(name).await
         }
-        UncertainDname::Relative(ref name) => {
+        name::UncertainDname::Relative(ref name) => {
             resolver.search_host(name).await
         }
     };
     match answer {
         Ok(answer) => {
-            if let UncertainDname::Relative(_) = name {
+            if let name::UncertainDname::Relative(_) = name {
                 println!("Found answer for {}", answer.qname());
             }
             let canon = answer.canonical_name();
@@ -84,15 +92,49 @@ async fn forward(resolver: &StubResolver, name: UncertainDname<Vec<u8>>) {
     }
 }
 
-async fn reverse(resolver: &StubResolver, addr: IpAddr) {
+async fn reverse(resolver: &StubResolver, addr: IpAddr, start: &Instant) {
     match resolver.lookup_addr(addr).await {
         Ok(answer) => {
+            let duration = Instant::now().duration_since(*start);
             for name in answer.iter() {
                 println!("Host {} has domain name pointer {}", addr, name);
             }
-        }
+            println!("Resolution took {0:.5}ms", duration.as_secs_f32()/1000.0);
+        },
         Err(err) => println!("Query failed: {}", err),
     }
+}
+
+async fn get_root_soa(resolver: &StubResolver) {
+    let root = name::Dname::root_vec();
+    let question = Question::new_in(root, Rtype::Soa);
+    match resolver.query(question).await {
+        Ok(answer) => {
+            if answer.opt().is_some() {
+                println!("Response has OPT section");
+            }
+            let mut seen_rrsig = false;
+            let mut seen_soa = false;
+            for r in answer.iter() {
+                match r {
+                    Ok((record, _section)) => {
+                        if record.rtype() == Rtype::Rrsig {
+                            seen_rrsig = true;
+                        } else if record.rtype() == Rtype::Soa {
+                            println!("SOA on name '{}'", record.owner());
+                            seen_soa = true;
+                        }
+
+                    },
+                    Err(err) => panic!("Failed parsing record: {}", err),
+                }
+            }
+            println!("Seen RRSIG: {} SOA: {}", seen_rrsig, seen_soa);
+        },
+        Err(err) => {
+            println!("Root soa resolution failed: {}", err);
+        }
+    };
 }
 
 #[tokio::main]
@@ -100,13 +142,14 @@ async fn resolve_async(resolver: &StubResolver, names: &Vec<String>) {
     println!("Asynchronous resolution");
     for name in names {
         if let Ok(addr) = IpAddr::from_str(name) {
-            reverse(&resolver, addr).await;
-        } else if let Ok(name) = UncertainDname::from_str(name) {
+            reverse(&resolver, addr, &Instant::now()).await;
+        } else if let Ok(name) = name::UncertainDname::from_str(name) {
             forward(&resolver, name).await;
         } else {
             println!("Not a domain name: {}", name);
         }
     }
+    get_root_soa(&resolver).await;
 }
 
 fn resolve_sync(names: &Vec<String>) {
