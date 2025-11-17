@@ -2,24 +2,38 @@
 // use domain::stub::StubResolver;
 
 use std::env;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 //use std::time::{Duration, Instant};
 use std::time::{Instant};
+use futures::executor::block_on;
 
 use dns_lookup;
-use domain::resolv::StubResolver;
+use domain::resolv::{StubResolver, stub::conf::{ResolvConf, ServerConf}};
 use domain::base::question::Question;
 use domain::base::name;
 use domain::base::iana::rtype::Rtype;
+use domain::base::ParsedName;
+use domain::rdata::ZoneRecordData;
 
+const DEBUG: bool = false;
 
-fn resolve_one_synchronous(name : &String) {
+struct StubNS {
+    address: SocketAddr,
+    name: String,
+    stub: StubResolver,
+    canonical: Option<String>,
+    gai_name: Option<String>
+}
+
+fn resolve_one_synchronous(mut stub : &StubNS) {
+    let name = &stub.name;
     let _r = match IpAddr::from_str(&name) {
         Ok(addr) => {
             match dns_lookup::lookup_addr(&addr) {
                 Ok(host) => {
                     println!("{} has hostname {}", &name, &host);
+                    //stub.gai_name = Some(name.clone());
                 },
                 Err(err) => {
                     println!("Error on {}: {}", name, err);
@@ -35,7 +49,7 @@ fn resolve_one_synchronous(name : &String) {
 }
 
 fn _async_test(_res : &StubResolver, name: &String) {
-    let _q = Question::new_in(name, domain::base::iana::rtype::Rtype::A);
+    let _q = Question::new_in(name, Rtype::A);
     // not like this
     //res.query(&q);
 }
@@ -51,6 +65,7 @@ fn print_options(res : &StubResolver) {
 
     let o = res.options();
 
+    if DEBUG {
     println!();
     println!("Local stub options:");
     print_opt_bool(o.recurse, "recursion");
@@ -62,20 +77,21 @@ fn print_options(res : &StubResolver) {
     print!("timeout: {} ", o.timeout.as_secs());
     println!("ndots: {}", o.ndots);
     println!();
+    }
 }
 
-async fn forward(resolver: &StubResolver, name: name::UncertainDname<Vec<u8>>) {
+async fn forward(resolver: &StubResolver, name: name::UncertainName<Vec<u8>>) {
     let answer = match name {
-        name::UncertainDname::Absolute(ref name) => {
+        name::UncertainName::Absolute(ref name) => {
             resolver.lookup_host(name).await
         }
-        name::UncertainDname::Relative(ref name) => {
+        name::UncertainName::Relative(ref name) => {
             resolver.search_host(name).await
         }
     };
     match answer {
         Ok(answer) => {
-            if let name::UncertainDname::Relative(_) = name {
+            if let name::UncertainName::Relative(_) = name {
                 println!("Found answer for {}", answer.qname());
             }
             let canon = answer.canonical_name();
@@ -92,36 +108,43 @@ async fn forward(resolver: &StubResolver, name: name::UncertainDname<Vec<u8>>) {
     }
 }
 
-async fn reverse(resolver: &StubResolver, addr: IpAddr, start: &Instant) {
+async fn reverse(resolver: &StubResolver, addr: IpAddr) {
+    let start = Instant::now();
     match resolver.lookup_addr(addr).await {
         Ok(answer) => {
-            let duration = Instant::now().duration_since(*start);
+            let duration = Instant::now().duration_since(start);
             for name in answer.iter() {
-                println!("Host {} has domain name pointer {}", addr, name);
+                println!("{} has hostname {}", addr, name);
             }
-            println!("Resolution took {0:.5}ms", duration.as_secs_f32()/1000.0);
+            println!("Resolution of {0} took {1:.5}ms", addr, duration.as_micros());
         },
         Err(err) => println!("Query failed: {}", err),
     }
 }
 
 async fn get_root_soa(resolver: &StubResolver) {
-    let root = name::Dname::root_vec();
-    let question = Question::new_in(root, Rtype::Soa);
+    let root = name::Name::root_vec();
+    let question = Question::new_in(root, Rtype::SOA);
     match resolver.query(question).await {
         Ok(answer) => {
             if answer.opt().is_some() {
-                println!("Response has OPT section");
+                let opt = answer.opt().unwrap();
+                if DEBUG {
+                    println!(". SOA:");
+                    println!("Response has OPT EDNS({}), UDP size: {}, DO: {}", opt.version(), opt.udp_payload_size(), opt.dnssec_ok());
+                }
             }
             let mut seen_rrsig = false;
             let mut seen_soa = false;
             for r in answer.iter() {
                 match r {
                     Ok((record, _section)) => {
-                        if record.rtype() == Rtype::Rrsig {
+                        if record.rtype() == Rtype::RRSIG {
                             seen_rrsig = true;
-                        } else if record.rtype() == Rtype::Soa {
-                            println!("SOA on name '{}'", record.owner());
+                        } else if record.rtype() == Rtype::SOA {
+                            if DEBUG {
+                                println!("SOA on name '{}'", record.owner());
+                            }
                             seen_soa = true;
                         }
 
@@ -137,39 +160,117 @@ async fn get_root_soa(resolver: &StubResolver) {
     };
 }
 
+async fn get_svcb(resolver: &StubResolver) {
+    let dnsname: name::Name<Vec<u8>> = name::Name::from_str("_dns.resolver.arpa").unwrap();
+    let question = Question::new_in(dnsname, Rtype::SVCB);
+    match resolver.query(question).await {
+        Ok(answer) => {
+            match answer.answer() {
+                Ok(records) => {
+                    for rr in records {
+                        // taken this crazy code from domain/examples/common/serve-utils.rs
+                        let r = rr
+                        .unwrap()
+                        .into_record::<ZoneRecordData<_, ParsedName<_>>>()
+                        .unwrap()
+                        .unwrap();
+                        //let r = rr.unwrap().to_record().unwrap();
+                        println!("# _dns SVCB: {}", r);
+                    }
+                },
+                Err(err2) => {
+                    println!("SVCB parsing failed: {}", err2);
+                }
+            }
+            if DEBUG {
+                println!("# _dns SVCB:\n{}", answer.display_dig_style());
+            }
+        },
+        Err(err) => {
+            println!("SVCB query parsing error: {}", err);
+        }
+    };
+}
+
+async fn get_resinfo(resolver: &StubResolver) {
+    let dnsname: name::Name<Vec<u8>> = name::Name::from_str("resolver.arpa").unwrap();
+    // FIXME: RESINFO is not supported. query TXT
+    let question = Question::new_in(dnsname, Rtype::TXT);
+    match resolver.query(question).await {
+        Ok(answer) => if DEBUG {
+            println!("TXT:\n{}", answer.display_dig_style());
+        },
+        Err(err) => {
+            println!("Root soa resolution failed: {}", err);
+        }
+    };
+}
+
 #[tokio::main]
-async fn resolve_async(resolver: &StubResolver, names: &Vec<String>) {
-    println!("Asynchronous resolution");
-    for name in names {
+async fn resolve_async(stubs: &Vec<StubNS>) {
+    println!("Asynchronous resolution:");
+
+    for stub in stubs {
+        println!("# {}", stub.name);
+        print_options(&stub.stub);
+        let name = &stub.name;
         if let Ok(addr) = IpAddr::from_str(name) {
-            reverse(&resolver, addr, &Instant::now()).await;
-        } else if let Ok(name) = name::UncertainDname::from_str(name) {
-            forward(&resolver, name).await;
+            reverse(&stub.stub, addr).await;
+        } else if let Ok(name) = name::UncertainName::from_str(name) {
+            forward(&stub.stub, name).await;
         } else {
             println!("Not a domain name: {}", name);
         }
+        let f2 = get_root_soa(&stub.stub);
+        let f3 = get_svcb(&stub.stub);
+        //let f4 = get_resinfo(&stub.stub);
+        futures::join!(f2, f3);
+        println!();
     }
-    get_root_soa(&resolver).await;
 }
 
-fn resolve_sync(names: &Vec<String>) {
+fn resolve_sync(names: &Vec<StubNS>) {
     println!("Blocking resolution:");
     for name in names {
         resolve_one_synchronous(&name);
     }
+    println!();
+}
+
+fn get_nameservers() -> Vec<StubNS> {
+    let mut servers = Vec::<StubNS>::new();
+    //let rc = ResolvConf::default();
+    let mut rc = ResolvConf::new();
+    rc.parse_file("/run/NetworkManager/no-stub-resolv.conf").unwrap();
+    for servconf in rc.servers {
+        let srv = servconf.addr.ip().to_string();
+        let mut found = false;
+        for s in &servers {
+            if &srv == &s.name {
+                found = true;
+            }
+        }
+        if !found {
+            let mut oneserv = ResolvConf::new();
+            oneserv.servers = vec![ServerConf::new(servconf.addr, servconf.transport)];
+            oneserv.finalize();
+            if DEBUG {
+                println!("Details: {}", &oneserv);
+            }
+            let stub = StubResolver::from_conf(oneserv);
+            println!("Server: {}", srv);
+            servers.push(StubNS { address: servconf.addr, name: srv, stub: stub, canonical: None, gai_name: None });
+        }
+    }
+    servers
 }
 
 fn main() {
     // example source: https://github.com/NLnetLabs/domain/blob/main/examples/lookup.rs
-    let names: Vec<_> = env::args().skip(1).collect();
-    if names.is_empty() {
-        println!("Usage: dnsinfo <hostname_or_addr> [...]");
-        return;
-    }
+    //let mut names: Vec<_> = env::args().skip(1).collect();
+    //if names.is_empty() {
+    let ns = get_nameservers();
 
-    resolve_sync(&names);
-
-    let res = StubResolver::new();
-    print_options(&res);
-    resolve_async(&res, &names);
+    resolve_sync(&ns);
+    resolve_async(&ns);
 }
