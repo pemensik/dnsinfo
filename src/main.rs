@@ -17,6 +17,7 @@ use domain::base::ParsedName;
 use domain::rdata::ZoneRecordData;
 
 const DEBUG: bool = false;
+const DEF_PATH: &str = "/run/NetworkManager/no-stub-resolv.conf";
 
 struct StubNS {
     address: SocketAddr,
@@ -237,11 +238,18 @@ fn resolve_sync(names: &Vec<StubNS>) {
     println!();
 }
 
-fn get_nameservers() -> Vec<StubNS> {
+fn get_nameservers(path: Option<String>) -> Vec<StubNS> {
     let mut servers = Vec::<StubNS>::new();
-    //let rc = ResolvConf::default();
     let mut rc = ResolvConf::new();
-    rc.parse_file("/run/NetworkManager/no-stub-resolv.conf").unwrap();
+    match path {
+        Some(path) => {
+            rc.parse_file(path).unwrap();
+        },
+        None => {
+            //rc = ResolvConf::default();
+            rc.parse_file(DEF_PATH).unwrap();
+        }
+    }
     for servconf in rc.servers {
         let srv = servconf.addr.ip().to_string();
         let mut found = false;
@@ -269,7 +277,14 @@ fn main() {
     // example source: https://github.com/NLnetLabs/domain/blob/main/examples/lookup.rs
     //let mut names: Vec<_> = env::args().skip(1).collect();
     //if names.is_empty() {
-    let ns = get_nameservers();
+    //
+    let names: Vec<_> = env::args().skip(1).collect();
+    let mut ns = Vec::<StubNS>::new();
+    if names.is_empty() {
+        ns = get_nameservers(None);
+    } else {
+        ns = get_nameservers(Some(names[0].clone()));
+    }
 
     resolve_sync(&ns);
     resolve_async(&ns);
